@@ -2,7 +2,7 @@ services:
   - type: web
     name: sms-fastapi
     env: python
-    repo: https://github.com/USERNAME/REPO_NAME
+    repo: https://github.com/Lunarixxc/my_app
     branch: main
     buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn main:app --host=0.0.0.0 --port=8000"
