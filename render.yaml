@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: sms-fastapi
+    env: python
+    repo: https://github.com/USERNAME/REPO_NAME
+    branch: main
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host=0.0.0.0 --port=8000"
+    autoDeploy: true
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        value: "<токен_твоего_бота>"
+      - key: TELEGRAM_CHAT_ID
+        value: "<твой chat_id>"
+      - key: GOOGLE_SA_JSON
+        value: "<сервисный аккаунт JSON строкой>"
+      - key: GOOGLE_SHEET_ID
+        value: "<ID таблицы Google Sheets>"
+      - key: ALLOWED_SENDERS
+        value: "900,SBERBANK"
+      - key: TG_SECRET_PATH
+        value: "secret123"
