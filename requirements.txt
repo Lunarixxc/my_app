@@ -1,6 +1,8 @@
 # requirements.txt
 fastapi==0.104.1
-pydantic==2.5.3
+# Указываем, что нужна версия Pydantic 1.x, у которой нет Rust
+pydantic>=1.10.0,<2.0.0
+
 uvicorn==0.24.0.post1
 httpx==0.27.0
 google-api-python-client==2.130.0
