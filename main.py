@@ -5,7 +5,7 @@ import json
 import hashlib
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict
-import pytz # Библиотека для работы с часовыми поясами
+import pytz  # Библиотека для работы с часовыми поясами
 
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
@@ -19,7 +19,7 @@ from googleapiclient.errors import HttpError
 app = FastAPI(
     title="Personal Finance Bot",
     description="Трекинг расходов с дневным бюджетом и умной копилкой.",
-    version="2.1.0"
+    version="2.2.0"
 )
 
 # --- Переменные окружения ---
@@ -35,7 +35,7 @@ MONTHLY_SAVINGS_GOAL = 20000.0
 MONTHLY_SPEND_BUDGET = MONTHLY_INCOME - MONTHLY_SAVINGS_GOAL
 AVG_DAYS_IN_MONTH = 30.4375
 DAILY_SPEND_LIMIT = round(MONTHLY_SPEND_BUDGET / AVG_DAYS_IN_MONTH, 2)
-MOSCOW_TZ = pytz.timezone('Europe/Moscow') # Указываем наш часовой пояс
+MOSCOW_TZ = pytz.timezone('Europe/Moscow')  # Указываем наш часовой пояс
 
 # --- Безопасная загрузка JSON ---
 try:
@@ -102,16 +102,14 @@ def parse_amount(text: str) -> Optional[float]:
         return None
 
 def parse_message(text: str) -> dict:
-    """Улучшенный парсер для описания."""
     data = {
         "type": "debit",
         "amount": parse_amount(text),
         "currency": "RUB",
-        "description": "", # По умолчанию пустое описание
+        "description": "",
         "balance_after": None,
     }
     
-    # Сначала ищем общее описание, если оно есть
     patterns = [
         r"Покупка на .*?, (.*?)(?=Доступно|Баланс|$)",
         r"Оплата через СБП на .*?, (.*?)(?=Доступно|Баланс|$)",
@@ -120,13 +118,11 @@ def parse_message(text: str) -> dict:
     for pattern in patterns:
         match = re.search(pattern, text, re.I)
         if match:
-            # Убираем лишние пробелы и возможные точки в конце
             data["description"] = match.group(1).strip().rstrip('.').strip()
-            break # Нашли описание, выходим из цикла
+            break
 
-    # Если после всех попыток описание пустое, используем весь текст как fallback
     if not data["description"]:
-        data["description"] = text.splitlines()[0] # Берем первую строку сообщения
+        data["description"] = text.splitlines()[0]
 
     if re.search(r"зачислен|пополнение|возврат|зарплата", text, re.I):
         data["type"] = "credit"
@@ -137,29 +133,24 @@ def parse_message(text: str) -> dict:
 
     return data
 
-# --- Логика бюджета (ИСПРАВЛЕНА) ---
+# --- Логика бюджета ---
 def calculate_budget_stats(all_rows: List[List[str]]) -> dict:
-    """Считает статистику по бюджету. Теперь с правильной логикой копилки."""
-    # Используем московское время для всех расчетов "сегодня" и "этот месяц"
     now_msk = datetime.now(MOSCOW_TZ)
     today_start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
     
     spent_today = 0.0
-    
     data_rows = all_rows[1:] if all_rows and all_rows[0] == HEADER else all_rows
 
-    if not data_rows: # Если данных нет, копилка равна нулю
+    if not data_rows:
         return {
             "spent_today": 0.0,
             "daily_limit_left": DAILY_SPEND_LIMIT,
             "smart_piggy_bank": 0.0
         }
 
-    # Находим дату самой первой транзакции для расчета копилки
-    first_transaction_ts_str = data_rows[0][2] # ts_msk
+    first_transaction_ts_str = data_rows[0][2]
     first_transaction_date = datetime.fromisoformat(first_transaction_ts_str).date()
     
-    # Считаем расходы с самого начала
     total_spent_since_start = 0.0
     for row in data_rows:
         try:
@@ -170,20 +161,13 @@ def calculate_budget_stats(all_rows: List[List[str]]) -> dict:
             amount = float(amount_str)
             
             total_spent_since_start += amount
-
             if ts_msk >= today_start_msk:
                 spent_today += amount
-
         except (ValueError, IndexError, TypeError):
             continue
             
-    # Логика копилки: считаем дни с ПЕРВОЙ транзакции, а не с начала месяца
     days_since_start = (now_msk.date() - first_transaction_date).days
-    
-    # Бюджет, который "выделен" на прошедшие дни
     planned_spend_to_date = days_since_start * DAILY_SPEND_LIMIT
-    
-    # Копилка = (сколько должны были потратить) - (сколько потратили на самом деле)
     smart_piggy_bank = planned_spend_to_date - total_spent_since_start
 
     return {
@@ -192,6 +176,29 @@ def calculate_budget_stats(all_rows: List[List[str]]) -> dict:
         "smart_piggy_bank": round(smart_piggy_bank, 2)
     }
 
+# --- Новая функция для парсинга времени ---
+def parse_flexible_time(time_str: str) -> datetime:
+    """Пытается распознать время из нескольких возможных форматов."""
+    time_str = time_str.replace('\u202f', ' ')
+    # Формат 1: '11.08, 9:49 PM'
+    try:
+        dt_obj = datetime.strptime(f"{datetime.now().year} {time_str}", '%Y %d.%m, %I:%M %p')
+        # Считаем, что пришедшее время уже в нашем целевом часовом поясе (Московском)
+        # и затем локализуем его, чтобы можно было конвертировать в UTC
+        localized_dt = MOSCOW_TZ.localize(dt_obj)
+        return localized_dt.astimezone(pytz.UTC)
+    except ValueError:
+        pass
+
+    # Формат 2: Стандартный ISO 8601
+    try:
+        return datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+    except ValueError:
+        pass
+
+    # Fallback: если ничего не подошло
+    return datetime.now(pytz.UTC)
+
 # --- Эндпоинты API ---
 class IncomingSms(BaseModel):
     body: str
@@ -199,12 +206,11 @@ class IncomingSms(BaseModel):
 
 @app.post("/sms")
 async def process_sms(payload: IncomingSms):
-    # Получаем время в UTC и сразу конвертируем в Московское
-    ts_utc_str = payload.time or datetime.utcnow().isoformat()
-    ts_utc = datetime.fromisoformat(ts_utc_str.replace('Z', '+00:00'))
+    ts_str = payload.time if payload.time else datetime.now(pytz.UTC).isoformat()
+    ts_utc = parse_flexible_time(ts_str)
     ts_msk = ts_utc.astimezone(MOSCOW_TZ)
     
-    msg_id = make_id(payload.body, ts_utc_str)
+    msg_id = make_id(payload.body, ts_utc.isoformat())
 
     all_rows = read_all_rows()
     data_rows = all_rows[1:] if all_rows and all_rows[0] == HEADER else all_rows
@@ -215,7 +221,6 @@ async def process_sms(payload: IncomingSms):
     if parsed.get("amount") is None:
         raise HTTPException(status_code=400, detail="Could not parse amount from message body.")
 
-    # Создаем новую строку с обоими форматами времени
     new_row = [
         msg_id,
         ts_utc.isoformat(),
@@ -232,12 +237,9 @@ async def process_sms(payload: IncomingSms):
     append_row(new_row)
 
     if parsed["type"] == "debit":
-        # Передаем в калькулятор обновленный список строк
         stats = calculate_budget_stats(data_rows + [new_row])
-        
         limit_left = stats['daily_limit_left']
         piggy_bank = stats['smart_piggy_bank']
-        
         emoji_status = "✅" if limit_left >= 0 else "⚠️"
         
         text = (
@@ -249,8 +251,6 @@ async def process_sms(payload: IncomingSms):
         await send_telegram(text)
 
     return {"status": "ok", "id": msg_id}
-
-# ... (остальной код с Telegram Webhook и read_root остается без изменений, но я добавлю его для полноты)
 
 @app.post(f"/telegram/webhook/{TG_SECRET_PATH}", include_in_schema=False)
 async def tg_webhook(update: Dict):
@@ -288,4 +288,4 @@ async def tg_webhook(update: Dict):
 
 @app.get("/", summary="Статус сервиса")
 def read_root():
-    return {"status": "ok", "version": "2.1.0"}
+    return {"status": "ok", "version": "2.2.0"}
