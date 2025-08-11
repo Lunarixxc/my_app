@@ -1,6 +1,6 @@
 # requirements.txt
 fastapi==0.104.1
-# Указываем, что нужна версия Pydantic 1.x, у которой нет Rust
+# Указываем, что нужна версия Pydantic 1.x, у которой нет Rust.
 pydantic>=1.10.0,<2.0.0
 
 uvicorn==0.24.0.post1
