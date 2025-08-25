@@ -3,12 +3,11 @@ import os
 import re
 import json
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional, List, Dict
-from collections import defaultdict
 import pytz
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
 
@@ -19,8 +18,8 @@ from googleapiclient.errors import HttpError
 # --- Конфигурация приложения ---
 app = FastAPI(
     title="Personal Finance Bot",
-    description="Трекинг расходов с дневным бюджетом и умной копилкой.",
-    version="2.3.0"
+    description="Трекинг расходов с персистентной копилкой и ручным вводом.",
+    version="3.1.0"
 )
 
 # --- Переменные окружения и константы ---
@@ -37,8 +36,7 @@ AVG_DAYS_IN_MONTH = 30.4375
 DAILY_SPEND_LIMIT = round(MONTHLY_SPEND_BUDGET / AVG_DAYS_IN_MONTH, 2)
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
-# --- Google Sheets и прочее (без изменений) ---
-# ... (весь код до `calculate_budget_stats` остается таким же, как в версии 2.2)
+# --- Google Sheets ---
 try:
     GOOGLE_SA_INFO = json.loads(google_sa_json_str)
 except json.JSONDecodeError:
@@ -46,28 +44,56 @@ except json.JSONDecodeError:
     GOOGLE_SA_INFO = json.loads(base64.b64decode(google_sa_json_str))
 SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 SHEET_NAME = "Transactions"
+STATE_SHEET_NAME = "State"
 HEADER = ["id", "ts_utc", "ts_msk", "amount", "currency", "type", "description", "balance_after", "source_msg"]
+
 def get_sheets_service():
     creds = Credentials.from_service_account_info(GOOGLE_SA_INFO, scopes=SHEETS_SCOPES)
     return build("sheets", "v4", credentials=creds)
-def read_all_rows():
+
+def read_state() -> Dict[str, str]:
     try:
         service = get_sheets_service()
-        result = service.spreadsheets().values().get(spreadsheetId=GOOGLE_SHEET_ID, range=f"{SHEET_NAME}!A:I").execute()
+        result = service.spreadsheets().values().get(spreadsheetId=GOOGLE_SHEET_ID, range=f"{STATE_SHEET_NAME}!A:B").execute()
+        rows = result.get("values", [])
+        return {row[0]: row[1] for row in rows[1:] if len(row) == 2}
+    except HttpError: return {}
+
+def update_state_value(key: str, value: any):
+    service = get_sheets_service()
+    body = {'values': [[str(value)]]}
+    state_data = read_all_rows(STATE_SHEET_NAME)
+    row_index = -1
+    for i, row in enumerate(state_data):
+        if row and row[0] == key: row_index = i + 1; break
+    if row_index != -1:
+        service.spreadsheets().values().update(spreadsheetId=GOOGLE_SHEET_ID, range=f"{STATE_SHEET_NAME}!B{row_index}", valueInputOption="RAW", body=body).execute()
+
+def read_all_rows(sheet_name: str) -> List[List[str]]:
+    try:
+        service = get_sheets_service()
+        result = service.spreadsheets().values().get(spreadsheetId=GOOGLE_SHEET_ID, range=f"{sheet_name}!A:Z").execute()
         return result.get("values", [])
     except HttpError: return []
+
 def append_row(row: list):
-    try:
-        service = get_sheets_service()
-        service.spreadsheets().values().append(spreadsheetId=GOOGLE_SHEET_ID, range=f"{SHEET_NAME}!A1", valueInputOption="USER_ENTERED", body={"values": [row]}).execute()
-    except HttpError as error:
-        print(f"Error appending row: {error}"); raise
+    service = get_sheets_service()
+    service.spreadsheets().values().append(spreadsheetId=GOOGLE_SHEET_ID, range=f"{SHEET_NAME}!A1", valueInputOption="USER_ENTERED", body={"values": [row]}).execute()
+
+def delete_last_row():
+    service = get_sheets_service()
+    rows = read_all_rows(SHEET_NAME)
+    if len(rows) < 2: return
+    last_row_index = len(rows)
+    service.spreadsheets().values().clear(spreadsheetId=GOOGLE_SHEET_ID, range=f"{SHEET_NAME}!A{last_row_index}:Z{last_row_index}", body={}).execute()
+
 async def send_telegram(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"; payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}
     async with httpx.AsyncClient(timeout=10) as client:
         try: await client.post(url, json=payload)
         except httpx.RequestError as e: print(f"Error sending to Telegram: {e}")
-def make_id(body: str, ts: str): raw = f"{body}|{ts}".encode("utf-8"); return hashlib.sha256(raw).hexdigest()[:16]
+
+# --- Утилиты и парсеры ---
 def parse_amount(text: str):
     match = re.search(r"(\d{1,3}(?:[ \u00A0]\d{3})*(?:[.,]\d{1,2})?)\s*₽", text)
     if not match: return None
@@ -92,104 +118,67 @@ def parse_flexible_time(time_str: str):
     try: return datetime.fromisoformat(time_str.replace('Z', '+00:00'))
     except ValueError: pass
     return datetime.now(pytz.UTC)
+def make_id(body: str, ts: str): raw = f"{body}|{ts}".encode("utf-8"); return hashlib.sha256(raw).hexdigest()[:16]
 
-# --- Логика бюджета (ПОЛНОСТЬЮ ПЕРЕПИСАНА) ---
-def calculate_budget_stats(all_rows: List[List[str]]) -> dict:
-    """
-    Считает статистику по бюджету с правильной логикой копилки.
-    Копилка - это результат ПРОШЕДШИХ дней.
-    Траты сегодня влияют только на остаток СЕГОДНЯ.
-    """
-    now_msk = datetime.now(MOSCOW_TZ)
-    today_date = now_msk.date()
-    
-    data_rows = all_rows[1:] if all_rows and all_rows[0] == HEADER else all_rows
-    
-    # Группируем все траты по дням
-    daily_spends = defaultdict(float)
+# --- РЕФАКТОРИНГ: Единая функция обработки расхода ---
+def process_debit_transaction(amount: float, description: str, source_msg: str = "") -> Dict:
+    """Обрабатывает транзакцию расхода, обновляет состояние и возвращает статистику."""
+    ts_utc = datetime.now(pytz.UTC)
+    ts_msk = ts_utc.astimezone(MOSCOW_TZ)
+    msg_id = make_id(source_msg or f"manual_{amount}", ts_utc.isoformat())
+
+    # 1. Обновляем состояние копилки
+    current_state = read_state()
+    piggy_bank = float(current_state.get('piggy_bank', 0.0))
+    new_piggy_bank = piggy_bank - amount
+    update_state_value('piggy_bank', new_piggy_bank)
+
+    # 2. Записываем транзакцию
+    all_rows = read_all_rows(SHEET_NAME)
+    if not all_rows: append_row(HEADER)
+    new_row = [msg_id, ts_utc.isoformat(), ts_msk.isoformat(), amount, "RUB", "debit", description, None, source_msg]
+    append_row(new_row)
+
+    # 3. Считаем статистику для ответа
+    spent_today = 0.0
+    today_date = ts_msk.date()
+    data_rows = (all_rows[1:] if all_rows else []) + [new_row]
     for row in data_rows:
         try:
-            ts_msk_str, amount_str, type_str = row[2], row[3], row[5]
-            if type_str != "debit":
-                continue
-            
-            ts_msk = datetime.fromisoformat(ts_msk_str)
-            amount = float(amount_str)
-            
-            daily_spends[ts_msk.date()] += amount
-        except (ValueError, IndexError, TypeError):
-            continue
-
-    # Рассчитываем копилку на основе ПРОШЕДШИХ дней
-    smart_piggy_bank = 0.0
-    for day, total_spent in daily_spends.items():
-        if day < today_date:
-            # Считаем результат дня: сэкономил (+) или перетратил (-)
-            day_result = DAILY_SPEND_LIMIT - total_spent
-            smart_piggy_bank += day_result
-            
-    # Расходы за сегодня берем отдельно
-    spent_today = daily_spends.get(today_date, 0.0)
+            row_ts = datetime.fromisoformat(row[2])
+            if row_ts.date() == today_date and row[5] == 'debit':
+                spent_today += float(row[3])
+        except (ValueError, IndexError): continue
     
-    # Остаток на сегодня - это просто лимит минус сегодняшние траты
     daily_limit_left = DAILY_SPEND_LIMIT - spent_today
+    overspent_monthly = max(0, -new_piggy_bank)
 
-    return {
-        "spent_today": round(spent_today, 2),
-        "daily_limit_left": round(daily_limit_left, 2),
-        "smart_piggy_bank": round(smart_piggy_bank, 2)
-    }
+    return {"daily_limit_left": daily_limit_left, "overspent_monthly": overspent_monthly}
 
-# --- Эндпоинты API (остаются без изменений) ---
+# --- Эндпоинты API ---
 class IncomingSms(BaseModel):
     body: str
     time: Optional[str] = None
 
 @app.post("/sms")
 async def process_sms(payload: IncomingSms):
-    ts_str = payload.time if payload.time else datetime.now(pytz.UTC).isoformat()
-    ts_utc = parse_flexible_time(ts_str)
-    ts_msk = ts_utc.astimezone(MOSCOW_TZ)
-    
-    msg_id = make_id(payload.body, ts_utc.isoformat())
-
-    all_rows = read_all_rows()
-    data_rows = all_rows[1:] if all_rows and all_rows[0] == HEADER else all_rows
-    if any(msg_id == row[0] for row in data_rows if row):
-        return {"status": "duplicate", "id": msg_id}
-
     parsed = parse_message(payload.body)
     if parsed.get("amount") is None:
         raise HTTPException(status_code=400, detail="Could not parse amount from message body.")
-
-    new_row = [msg_id, ts_utc.isoformat(), ts_msk.isoformat(), parsed["amount"], parsed["currency"], "debit", parsed["description"], parsed["balance_after"], payload.body.strip()]
     
-    # Добавляем новую строку ПЕРЕД расчетом, чтобы он был актуальным
-    if not all_rows:
-        append_row(HEADER)
-        all_rows.append(HEADER) # Добавляем для корректного расчета
+    amount = parsed["amount"]
     
-    append_row(new_row)
-    data_rows.append(new_row) # И добавляем в локальную копию для передачи в калькулятор
-
     if parsed["type"] == "debit":
-        stats = calculate_budget_stats(data_rows)
-        limit_left = stats['daily_limit_left']
-        piggy_bank = stats['smart_piggy_bank']
-        
-        # Общий доступный баланс для трат = остаток на сегодня + копилка
-        total_available = limit_left + piggy_bank
-        emoji_status = "✅" if total_available >= 0 else "🆘"
-        
+        stats = process_debit_transaction(amount, parsed["description"], payload.body.strip())
         text = (
-            f"<b>Расход: {parsed['amount']} {parsed['currency']}</b> ({parsed['description']})\n\n"
-            f"Остаток на сегодня: <b>{limit_left:+.2f} ₽</b>\n"
-            f"🐷 В копилке: <code>{piggy_bank:+.2f} ₽</code>\n"
-            f"<b>{emoji_status} Итого доступно: {total_available:+.2f} ₽</b>"
+            f"<b>Расход:</b> {amount} ₽\n\n"
+            f"<b>Остаток на сегодня:</b> {stats['daily_limit_left']:+.2f} ₽\n"
+            f"<b>Потрачено за месяц лишнего:</b> {stats['overspent_monthly']:.2f} ₽"
         )
         await send_telegram(text)
-
-    return {"status": "ok", "id": msg_id}
+    # TODO: можно добавить обработку для `credit` (пополнений) в будущем
+    
+    return {"status": "ok"}
 
 @app.post(f"/telegram/webhook/{TG_SECRET_PATH}", include_in_schema=False)
 async def tg_webhook(update: Dict):
@@ -197,35 +186,71 @@ async def tg_webhook(update: Dict):
     if not message or str(message.get("chat", {}).get("id")) != TELEGRAM_CHAT_ID:
         return {"ok": True}
 
-    text = message.get("text", "").strip().lower()
+    text = message.get("text", "").strip()
+    command = text.lower() # для сравнения команд
     
-    if text in ("/start", "/help"):
+    if command in ("/start", "/help"):
         await send_telegram(
             "Привет! Я твой финансовый бот.\n"
-            "Я автоматически считаю твои расходы и дневной бюджет.\n\n"
             "<b>Доступные команды:</b>\n"
-            "/status - Показать текущий бюджет на день и состояние копилки.\n"
-            f"Твой дневной лимит: <b>{DAILY_SPEND_LIMIT} ₽</b>"
+            "/status - Показать текущий бюджет.\n"
+            "/add <b>сумма</b> - Ручной ввод расхода (например, <code>/add 150.50</code>).\n"
+            "/cancel - Отменить последнюю транзакцию."
         )
-    elif text == "/status":
-        all_rows = read_all_rows()
-        stats = calculate_budget_stats(all_rows)
-        limit_left = stats['daily_limit_left']
-        piggy_bank = stats['smart_piggy_bank']
-        total_available = limit_left + piggy_bank
-        
+    elif command == "/status":
+        state = read_state()
+        piggy_bank = float(state.get('piggy_bank', 0.0))
+        overspent_monthly = max(0, -piggy_bank)
         report = (
-            f"<b>Статус на сегодня:</b>\n\n"
+            f"<b>Текущий статус:</b>\n\n"
             f"Дневной лимит: {DAILY_SPEND_LIMIT} ₽\n"
-            f"Потрачено сегодня: {stats['spent_today']} ₽\n"
-            f"Остаток на сегодня: <b>{limit_left:+.2f} ₽</b>\n\n"
-            f"🐷 В копилке: <code>{piggy_bank:+.2f} ₽</code>\n"
-            f"<b>Итого доступно для трат: {total_available:+.2f} ₽</b>"
+            f"Потрачено за месяц лишнего: {overspent_monthly:.2f} ₽\n"
+            f"Сэкономлено (в копилке): {max(0, piggy_bank):.2f} ₽"
         )
         await send_telegram(report)
         
+    elif command.startswith("/add "):
+        try:
+            amount_str = text.split(" ", 1)[1]
+            amount = float(amount_str)
+            if amount <= 0:
+                await send_telegram("Сумма должна быть положительным числом.")
+                return {"ok": True}
+            
+            # Используем нашу новую централизованную функцию
+            stats = process_debit_transaction(amount, "Ручной ввод", f"Manual entry via /add")
+            
+            # Отправляем такое же сообщение, как и при SMS
+            response_text = (
+                f"<b>Расход (вручную):</b> {amount} ₽\n\n"
+                f"<b>Остаток на сегодня:</b> {stats['daily_limit_left']:+.2f} ₽\n"
+                f"<b>Потрачено за месяц лишнего:</b> {stats['overspent_monthly']:.2f} ₽"
+            )
+            await send_telegram(response_text)
+
+        except (ValueError, IndexError):
+            await send_telegram("Неверный формат. Используйте: <code>/add СУММА</code> (например, <code>/add 500</code>)")
+
+    elif command == "/cancel":
+        all_rows = read_all_rows(SHEET_NAME)
+        if len(all_rows) < 2:
+            await send_telegram("Нет транзакций для отмены."); return {"ok": True}
+        
+        last_transaction = all_rows[-1]
+        try:
+            amount_to_revert = float(last_transaction[3]); transaction_type = last_transaction[5]; description = last_transaction[6]
+        except (ValueError, IndexError):
+            await send_telegram("Ошибка: не удалось прочитать последнюю транзакцию."); return {"ok": True}
+            
+        state = read_state(); piggy_bank = float(state.get('piggy_bank', 0.0))
+        new_piggy_bank = piggy_bank + amount_to_revert if transaction_type == "debit" else piggy_bank - amount_to_revert
+        update_state_value('piggy_bank', new_piggy_bank)
+        
+        delete_last_row()
+        await send_telegram(f"✅ Последняя транзакция ({description} на {amount_to_revert} ₽) отменена.")
+
     return {"ok": True}
 
 @app.get("/", summary="Статус сервиса")
 def read_root():
-    return {"status": "ok", "version": "2.3.0"}
+    return {"status": "ok", "version": "3.1.0"}
