@@ -100,7 +100,7 @@ def parse_flexible_time(time_str: str):
     try: return datetime.fromisoformat(time_str.replace('Z', '+00:00'))
     except ValueError: pass
     return datetime.now(pytz.UTC)
-def make_id(body: str, ts: str): raw = f"{body}|{ts}".encode("utf-8"); return hashlib.sha26(raw).hexdigest()[:16]
+def make_id(body: str, ts: str): raw = f"{body}|{ts}".encode("utf-8"); return hashlib.sha256(raw).hexdigest()[:16]
 
 # --- НОВАЯ, ИСПРАВЛЕННАЯ ЛОГИКА БЮДЖЕТА ---
 def calculate_budget_stats(all_rows: List[List[str]]) -> Dict:
